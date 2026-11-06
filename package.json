@@ -1,6 +1,6 @@
 {
   "name": "linguadock",
-  "version": "0.1.2",
+  "version": "0.2.2",
   "description": "A private, bring-your-own-key AI translation desktop app",
   "author": "luopc1218",
   "license": "MIT",
@@ -14,7 +14,8 @@
   "dependencies": {
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "lucide-react": "^0.468.0"
+    "lucide-react": "^0.468.0",
+    "electron-updater": "^6.8.11"
   },
   "devDependencies": {
     "@types/react": "^19.2.0",
@@ -33,6 +34,7 @@
     "directories": {
       "output": "release"
     },
+    "afterPack": "scripts/afterPack.cjs",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -46,9 +48,16 @@
           "arch": [
             "arm64"
           ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
         }
       ],
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": false
     },
     "win": {
       "target": [

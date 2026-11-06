@@ -4,51 +4,166 @@ const {
   ipcMain,
   safeStorage,
   dialog,
+  shell,
 } = require("electron");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const { requestFor, extract } = require("./providers.cjs");
+const { autoUpdater } = require("electron-updater");
+
+const RELEASES_URL = "https://github.com/luopc1218/linguadock/releases/latest";
+const PROTOCOLS = ["openai", "anthropic", "gemini"];
+const MAX_TEXT = 50000;
+const MAX_CONTEXT = 2000;
+const MAX_GLOSSARY = 10000;
+
 let win,
   state = { providers: [] },
-  active;
+  active,
+  updateStatus = { state: "idle" },
+  updaterReady = false;
+
 const file = () => path.join(app.getPath("userData"), "providers.json");
-function secure() {
-  return (
-    safeStorage.isEncryptionAvailable() &&
-    (process.platform !== "linux" ||
-      safeStorage.getSelectedStorageBackend() !== "basic_text")
-  );
+
+function fail(code, detail) {
+  throw new Error(detail === undefined ? code : `${code}|${detail}`);
 }
+
+async function readJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    fail("ERR_BAD_RESPONSE");
+  }
+}
+
+const keyCache = new Map();
+
+// Never call safeStorage just to probe availability: on macOS even the
+// capability check touches the login keychain and raises an authorization
+// dialog. Encryption/decryption below are the only keychain entry points.
+function keyStoreUnsupported() {
+  try {
+    return (
+      process.platform === "linux" &&
+      safeStorage.getSelectedStorageBackend() === "basic_text"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function publicState() {
   return {
     providers: state.providers.map(({ secret, ...p }) => ({
       ...p,
       hasKey: !!secret,
     })),
-    secureStorage: secure(),
     version: app.getVersion(),
+    locale: app.getLocale(),
   };
 }
+
 async function persist() {
   const tmp = file() + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(state), { mode: 0o600 });
   await fs.rename(tmp, file());
 }
+
 function register(name, fn) {
   ipcMain.handle(name, async (event, ...args) => {
-    if (event.sender !== win.webContents) throw new Error("Invalid sender");
+    if (!win || event.sender !== win.webContents)
+      throw new Error("ERR_INVALID_SENDER");
     return fn(...args);
   });
 }
+
+function setUpdate(status) {
+  updateStatus = status;
+  if (win && !win.isDestroyed()) win.webContents.send("update-status", status);
+}
+
+function canAutoUpdate() {
+  if (!app.isPackaged || process.argv.includes("--dev")) return false;
+  // Only AppImage builds can self-update on Linux; .deb installs use the
+  // package manager instead.
+  if (process.platform === "linux" && !process.env.APPIMAGE) return false;
+  return true;
+}
+
+function checkForUpdates() {
+  if (!canAutoUpdate()) {
+    setUpdate({ state: "unsupported" });
+    return updateStatus;
+  }
+  if (updateStatus.state === "checking" || updateStatus.state === "downloading")
+    return updateStatus;
+  setUpdate({ state: "checking" });
+  Promise.resolve()
+    .then(() => autoUpdater.checkForUpdates())
+    .catch((e) =>
+      setUpdate({ state: "error", message: updateErrorMessage(e) }),
+    );
+  return updateStatus;
+}
+
+function updateErrorMessage(e) {
+  const text = String(e?.message || e);
+  if (/404/.test(text) && /\.ya?ml/i.test(text)) return "ERR_UPDATE_NO_METADATA";
+  const line = text.split("\n").find((x) => x.trim()) || text;
+  return line.length > 240 ? line.slice(0, 240) + "…" : line;
+}
+
+function setupUpdater() {
+  if (updaterReady) return;
+  updaterReady = true;
+  if (!canAutoUpdate()) {
+    setUpdate({ state: "unsupported" });
+    return;
+  }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on("checking-for-update", () =>
+    setUpdate({ state: "checking" }),
+  );
+  autoUpdater.on("update-available", (info) =>
+    setUpdate({ state: "available", version: info?.version }),
+  );
+  autoUpdater.on("update-not-available", () =>
+    setUpdate({ state: "none" }),
+  );
+  autoUpdater.on("download-progress", (p) =>
+    setUpdate({
+      state: "downloading",
+      version: updateStatus.version,
+      percent: Math.round(p?.percent || 0),
+    }),
+  );
+  autoUpdater.on("update-downloaded", (info) =>
+    setUpdate({ state: "downloaded", version: info?.version }),
+  );
+  autoUpdater.on("error", (e) =>
+    setUpdate({ state: "error", message: updateErrorMessage(e) }),
+  );
+  setTimeout(() => {
+    if (updateStatus.state === "idle") checkForUpdates();
+  }, 8000);
+}
+
 app.whenReady().then(async () => {
+  app.setAppUserModelId("io.github.luopc1218.linguadock");
   try {
     state = JSON.parse(await fs.readFile(file(), "utf8"));
-    if (!Array.isArray(state.providers)) throw Error();
+    if (!Array.isArray(state.providers)) throw Error("invalid");
   } catch (e) {
     if (e.code !== "ENOENT") {
+      const zh = app.getLocale().toLowerCase().startsWith("zh");
       dialog.showErrorBox(
-        "配置读取失败",
-        "请备份并检查用户数据目录中的 providers.json，应用不会覆盖损坏的配置。",
+        zh ? "配置读取失败" : "Configuration error",
+        zh
+          ? "请备份并检查用户数据目录中的 providers.json，应用不会覆盖损坏的配置。"
+          : "Back up and inspect providers.json in the user data folder. The app will not overwrite a damaged configuration.",
       );
       app.quit();
       return;
@@ -60,26 +175,44 @@ app.whenReady().then(async () => {
       !p ||
       typeof p.name !== "string" ||
       !p.name.trim() ||
-      !p.model?.trim() ||
-      !["openai", "anthropic", "gemini"].includes(p.protocol)
+      typeof p.model !== "string" ||
+      !p.model.trim() ||
+      !PROTOCOLS.includes(p.protocol)
     )
-      throw Error("请填写服务名称和模型");
-    requestFor(p, "", "test", "自动检测", "中文", "自然", "");
+      fail("ERR_NAME_MODEL");
+    if (typeof p.baseUrl !== "string" || !p.baseUrl.trim())
+      fail("ERR_URL_INVALID");
+    requestFor(
+      { ...p, baseUrl: p.baseUrl.trim() },
+      "",
+      "test",
+      "auto",
+      "Simplified Chinese",
+      "natural and fluent",
+      "",
+      "",
+    );
     const old = state.providers.find((x) => x.id === p.id);
+    const id = old?.id || randomUUID();
+    const newApiKey =
+      typeof p.apiKey === "string" ? p.apiKey.trim() : "";
     let secret = old?.secret || "";
-    if (p.apiKey) {
-      if (!secure())
-        throw Error(
-          "系统安全密钥库不可用，请启用 Keychain / Secret Service / KWallet 后再保存 API Key",
-        );
-      secret = safeStorage.encryptString(p.apiKey).toString("base64");
+    if (newApiKey) {
+      if (keyStoreUnsupported()) fail("ERR_KEYRING_UNAVAILABLE");
+      try {
+        secret = (
+          await safeStorage.encryptStringAsync(newApiKey)
+        ).toString("base64");
+      } catch {
+        fail("ERR_KEYRING_UNAVAILABLE");
+      }
     }
     const entry = {
-      id: old?.id || require("node:crypto").randomUUID(),
+      id,
       name: p.name.trim().slice(0, 80),
       protocol: p.protocol,
-      baseUrl: p.baseUrl.trim(),
-      model: p.model.trim(),
+      baseUrl: p.baseUrl.trim().slice(0, 2048),
+      model: p.model.trim().slice(0, 200),
       secret,
     };
     const next = state.providers.filter((x) => x.id !== entry.id).concat(entry);
@@ -91,6 +224,7 @@ app.whenReady().then(async () => {
       state = previous;
       throw e;
     }
+    if (newApiKey) keyCache.set(entry.id, newApiKey);
     return publicState();
   });
   register("deleteProvider", async (id) => {
@@ -102,29 +236,110 @@ app.whenReady().then(async () => {
       state = previous;
       throw e;
     }
+    keyCache.delete(id);
     return publicState();
   });
+  register("testProvider", async (p) => {
+    if (!p || typeof p !== "object") fail("ERR_UNKNOWN");
+    if (typeof p.model !== "string" || !p.model.trim())
+      fail("ERR_MODEL_REQUIRED");
+    if (!PROTOCOLS.includes(p.protocol)) fail("ERR_PROTOCOL_INVALID");
+    if (typeof p.baseUrl !== "string" || !p.baseUrl.trim())
+      fail("ERR_URL_INVALID");
+    let key = typeof p.apiKey === "string" ? p.apiKey.trim() : "";
+    if (!key && p.id) {
+      const cached = keyCache.get(p.id);
+      if (cached !== undefined) {
+        key = cached;
+      } else {
+        const saved = state.providers.find((x) => x.id === p.id);
+        if (saved?.secret) {
+          try {
+            key = (
+              await safeStorage.decryptStringAsync(
+                Buffer.from(saved.secret, "base64"),
+              )
+            ).result;
+            keyCache.set(p.id, key);
+          } catch {
+            fail("ERR_KEY_DECRYPT");
+          }
+        }
+      }
+    }
+    const provider = {
+      ...p,
+      baseUrl: p.baseUrl.trim(),
+      model: p.model.trim(),
+    };
+    const { url, options } = requestFor(
+      provider,
+      key,
+      "Hello",
+      "auto",
+      "Simplified Chinese",
+      "natural and fluent",
+      "",
+      "",
+    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const started = Date.now();
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        redirect: "error",
+      });
+      if (!response.ok) fail("ERR_HTTP", String(response.status));
+      extract(provider, await readJson(response));
+      return { ms: Date.now() - started };
+    } catch (e) {
+      if (e.name === "AbortError") fail("ERR_TIMEOUT");
+      if (e.message === "fetch failed") fail("ERR_NETWORK");
+      throw e;
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
   register("translate", async (input) => {
-    if (active) throw Error("已有翻译正在进行");
+    if (active) fail("ERR_BUSY");
+    if (!input || typeof input !== "object") fail("ERR_UNKNOWN");
     const p = state.providers.find((x) => x.id === input.providerId);
-    if (!p) throw Error("请先添加 AI 服务");
-    if (
-      typeof input.text !== "string" ||
-      !input.text.trim() ||
-      input.text.length > 50000
-    )
-      throw Error("请输入 1–50,000 字符的原文");
-    const key = p.secret
-      ? safeStorage.decryptString(Buffer.from(p.secret, "base64"))
-      : "";
+    if (!p) fail("ERR_NO_PROVIDER");
+    const text = typeof input.text === "string" ? input.text : "";
+    if (!text.trim() || text.length > MAX_TEXT) fail("ERR_TEXT_RANGE");
+    let key = keyCache.get(p.id);
+    if (key === undefined) {
+      key = "";
+      if (p.secret) {
+        try {
+          const decrypted = await safeStorage.decryptStringAsync(
+            Buffer.from(p.secret, "base64"),
+          );
+          key = decrypted.result;
+          keyCache.set(p.id, key);
+        } catch {
+          keyCache.delete(p.id);
+          fail("ERR_KEY_DECRYPT");
+        }
+      }
+    }
     const { url, options } = requestFor(
       p,
       key,
-      input.text,
-      input.source,
-      input.target,
-      input.style,
-      String(input.glossary || "").slice(0, 10000),
+      text,
+      typeof input.source === "string" ? input.source.slice(0, 80) : "auto",
+      typeof input.target === "string" && input.target
+        ? input.target.slice(0, 80)
+        : "Simplified Chinese",
+      typeof input.style === "string" && input.style
+        ? input.style.slice(0, 120)
+        : "natural and fluent",
+      String(input.glossary || "").slice(0, MAX_GLOSSARY),
+      typeof input.context === "string"
+        ? input.context.slice(0, MAX_CONTEXT)
+        : "",
     );
     const controller = new AbortController();
     active = controller;
@@ -135,15 +350,11 @@ app.whenReady().then(async () => {
         signal: controller.signal,
         redirect: "error",
       });
-      if (!response.ok)
-        throw Error(
-          `API 请求失败（HTTP ${response.status}），请检查密钥、额度、模型和服务地址`,
-        );
-      return extract(p, await response.json());
+      if (!response.ok) fail("ERR_HTTP", String(response.status));
+      return extract(p, await readJson(response));
     } catch (e) {
-      if (e.name === "AbortError") throw Error("翻译已取消或请求超时");
-      if (e.message === "fetch failed")
-        throw Error("连接失败，请检查网络和 API 地址");
+      if (e.name === "AbortError") fail("ERR_TIMEOUT");
+      if (e.message === "fetch failed") fail("ERR_NETWORK");
       throw e;
     } finally {
       clearTimeout(timeout);
@@ -155,27 +366,37 @@ app.whenReady().then(async () => {
   });
   register("importText", async () => {
     const r = await dialog.showOpenDialog(win, {
-      filters: [{ name: "文本 / Markdown", extensions: ["txt", "md"] }],
+      filters: [{ name: "Text / Markdown", extensions: ["txt", "md"] }],
       properties: ["openFile"],
     });
     if (r.canceled) return null;
     const stat = await fs.stat(r.filePaths[0]);
-    if (stat.size > 200000)
-      throw Error("文件过大，请导入 200 KB 以内的 UTF-8 文本");
-    return fs.readFile(r.filePaths[0], "utf8");
+    if (stat.size > 200000) fail("ERR_FILE_TOO_LARGE");
+    const content = await fs.readFile(r.filePaths[0], "utf8");
+    if (content.length > MAX_TEXT) fail("ERR_TEXT_RANGE");
+    return content;
   });
   register("exportText", async (text) => {
-    if (typeof text !== "string") throw Error("无效译文");
+    if (typeof text !== "string") fail("ERR_INVALID_TEXT");
     const r = await dialog.showSaveDialog(win, {
       defaultPath: "translation.md",
       filters: [
         { name: "Markdown", extensions: ["md"] },
-        { name: "文本", extensions: ["txt"] },
+        { name: "Text", extensions: ["txt"] },
       ],
     });
     if (!r.canceled) await fs.writeFile(r.filePath, text, "utf8");
     return !r.canceled;
   });
+  register("getUpdateStatus", () => updateStatus);
+  register("checkUpdate", () => checkForUpdates());
+  register("installUpdate", () => {
+    if (updateStatus.state !== "downloaded") return false;
+    setImmediate(() => autoUpdater.quitAndInstall());
+    return true;
+  });
+  register("openReleases", () => shell.openExternal(RELEASES_URL));
+
   function createWindow() {
     win = new BrowserWindow({
       width: 1240,
@@ -192,7 +413,8 @@ app.whenReady().then(async () => {
     });
     win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     win.webContents.on("will-navigate", (e) => e.preventDefault());
-    if (process.argv.includes("--dev")) win.loadURL("http://127.0.0.1:5173");
+    if (process.argv.includes("--dev"))
+      win.loadURL("http://127.0.0.1:5173");
     else win.loadFile(path.join(__dirname, "../dist/index.html"));
     win.on("closed", () => {
       active?.abort();
@@ -200,6 +422,7 @@ app.whenReady().then(async () => {
     });
   }
   createWindow();
+  setupUpdater();
   app.on("activate", () => {
     if (!win) createWindow();
   });
