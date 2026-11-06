@@ -27,7 +27,7 @@ type Provider = {
   hasKey?: boolean;
   apiKey?: string;
 };
-type State = { providers: Provider[]; secureStorage: boolean };
+type State = { providers: Provider[]; secureStorage: boolean; version?: string };
 type Input = {
   providerId: string;
   text: string;
@@ -264,7 +264,7 @@ function App() {
             AI 服务设置
           </button>
           <div className="version">
-            LinguaDock <span>v0.1.0</span>
+            LinguaDock <span>v{state.version || "0.1.2"}</span>
           </div>
         </div>
       </aside>

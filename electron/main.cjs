@@ -26,6 +26,7 @@ function publicState() {
       hasKey: !!secret,
     })),
     secureStorage: secure(),
+    version: app.getVersion(),
   };
 }
 async function persist() {
